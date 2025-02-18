@@ -23,7 +23,7 @@ else
 fi
 
 if [ "$1" == "256" ]; then
-CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluation/inference.py \
+CUDA_VISIBLE_DEVICES=1 python3 scripts/evaluation/inference.py \
 --seed ${seed} \
 --ckpt_path $ckpt \
 --config $config \
@@ -38,7 +38,7 @@ CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluation/inference.py \
 --video_length 16 \
 --frame_stride ${FS}
 else
-CUDA_VISIBLE_DEVICES=0 python3 scripts/evaluation/inference.py \
+CUDA_VISIBLE_DEVICES=1 python3 scripts/evaluation/inference.py \
 --seed ${seed} \
 --ckpt_path $ckpt \
 --config $config \

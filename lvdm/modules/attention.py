@@ -78,15 +78,69 @@ class CrossAttention(nn.Module):
                 self.register_parameter('alpha', nn.Parameter(torch.tensor(0.)) )
 
 
-    def forward(self, x, context=None, mask=None):
+    def forward(self, x, context=None, mask=None, attn_bias=None, mode=None):
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
+        
+        assert mode == 'temporal'
 
+        if mask is not None:
+            # indices = mask['indices']
+            indices1 = mask[mode]['indices1']
+            indices2 = indices1.squeeze()
+            actual_indices = mask[mode]['actual_indices']
+            mask = mask['mask']
+        if mask is not None:
+            # time_stamp = time.time()
+            mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
+            if context is not None:
+                seq_len_kv = context.shape[1]
+                attn_bias = attn_bias[mode]['cross']
+            else:
+                attn_bias = attn_bias[mode]['self']
+        
         h = self.heads
         q = self.to_q(x)
         context = default(context, x)
-
+        k = self.to_k(context)
+        v = self.to_v(context)
+        if attn_bias is not None:
+            b, _, _ = x.shape # (bhw, t, c) 
+            # indices1 = torch.nonzero(mask.reshape(1, -1).squeeze(0))
+            cat_x = x.reshape(-1, x.shape[-1])
+            cat_x= torch.index_select(cat_x, 0, indices1.squeeze())
+            # time_stamp = time.time()
+            # print('org prepare cat_x time: ', time.time() - time_stamp)
+            cat_q = self.to_q(cat_x)
+            head_dim = x.shape[-1] // self.heads
+            cat_q = cat_q.view(1, -1, self.heads, head_dim) 
+            cat_k = k.view(1, -1, self.heads, head_dim)
+            cat_v = v.view(1, -1, self.heads, head_dim)
+            
+            out_with_bias = xformers.ops.memory_efficient_attention(cat_q, cat_k, cat_v, 
+                                                                    attn_bias=attn_bias, op=None)
+            out_with_bias = out_with_bias.reshape(1, out_with_bias.shape[1], self.heads * head_dim)
+            out_with_bias = self.to_out(out_with_bias)
+                # return out_with_bias + cat_x.unsqueeze(0)
+            # print('attn time with mask: ', time.time() - time_stamp)
+            
+            # time_stamp = time.time()
+            out = torch.zeros_like(x)
+            q_dtype = cat_q.dtype
+            out = out.to(q_dtype)
+            out = out.reshape(b, out.shape[1], self.heads * self.dim_head) 
+            
+            out = out.reshape(-1, out.shape[-1])
+            out.index_put_((indices2,), out_with_bias.squeeze())
+            out = out.reshape(b, x.shape[1], self.heads * self.dim_head)
+            actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+            out = out.gather(1, actual_indices)
+            return out
+        
+        
         if self.image_cross_attention and not spatial_self_attn:
+            print("image_cross_attention")
             context, context_image = context[:,:self.text_context_len,:], context[:,self.text_context_len:,:]
             k = self.to_k(context)
             v = self.to_v(context)
@@ -95,6 +149,7 @@ class CrossAttention(nn.Module):
         else:
             if not spatial_self_attn:
                 context = context[:,:self.text_context_len,:]
+                print("not spatial_self_attn")
             k = self.to_k(context)
             v = self.to_v(context)
 
@@ -108,11 +163,11 @@ class CrossAttention(nn.Module):
             sim += sim2
         del k
 
-        if exists(mask):
-            ## feasible for causal attention mask only
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b i j -> (b h) i j', h=h)
-            sim.masked_fill_(~(mask>0.5), max_neg_value)
+        # if exists(mask):
+        #     ## feasible for causal attention mask only
+        #     max_neg_value = -torch.finfo(sim.dtype).max
+        #     mask = repeat(mask, 'b i j -> (b h) i j', h=h)
+        #     sim.masked_fill_(~(mask>0.5), max_neg_value)
 
         # attention, what we cannot get enough of
         sim = sim.softmax(dim=-1)
@@ -143,7 +198,7 @@ class CrossAttention(nn.Module):
         
         return self.to_out(out)
     
-    def efficient_forward(self, x, context=None, mask=None):
+    def efficient_forward(self, x, context=None, mask=None, attn_bias=None, mode=None):
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
 
@@ -228,20 +283,22 @@ class BasicTransformerBlock(nn.Module):
         self.checkpoint = checkpoint
 
 
-    def forward(self, x, context=None, mask=None, **kwargs):
+    def forward(self, x, context=None, mask=None, attn_bias=None, mode='spatial', **kwargs):
         ## implementation tricks: because checkpointing doesn't support non-tensor (e.g. None or scalar) arguments
         input_tuple = (x,)      ## should not be (x), otherwise *input_tuple will decouple x into multiple arguments
         if context is not None:
             input_tuple = (x, context)
-        if mask is not None:
-            forward_mask = partial(self._forward, mask=mask)
-            return checkpoint(forward_mask, (x,), self.parameters(), self.checkpoint)
+        input_tuple = (x, context, mask, attn_bias, mode)
+        # if mask is not None:
+        #     forward_mask = partial(self._forward, mask=mask)
+        #     return checkpoint(forward_mask, (x,), self.parameters(), self.checkpoint)
         return checkpoint(self._forward, input_tuple, self.parameters(), self.checkpoint)
 
 
-    def _forward(self, x, context=None, mask=None):
-        x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, mask=mask) + x
-        x = self.attn2(self.norm2(x), context=context, mask=mask) + x
+    def _forward(self, x, context=None, mask=None, attn_bias=None, mode='spatial'):
+        x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, mask=mask,
+                       attn_bias=attn_bias, mode=mode) + x
+        x = self.attn2(self.norm2(x), context=context, mask=mask, attn_bias=attn_bias, mode=mode) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -291,7 +348,7 @@ class SpatialTransformer(nn.Module):
         self.use_linear = use_linear
 
 
-    def forward(self, x, context=None, **kwargs):
+    def forward(self, x, context=None, mask=None, attn_bias=None, **kwargs):
         b, c, h, w = x.shape
         x_in = x
         x = self.norm(x)
@@ -362,7 +419,7 @@ class TemporalTransformer(nn.Module):
             self.proj_out = zero_module(nn.Linear(inner_dim, in_channels))
         self.use_linear = use_linear
 
-    def forward(self, x, context=None):
+    def forward(self, x, context=None, mask=None, attn_bias=None):
         b, c, t, h, w = x.shape
         x_in = x
         x = self.norm(x)
@@ -378,16 +435,16 @@ class TemporalTransformer(nn.Module):
             # slice the from mask map
             temp_mask = self.mask[:,:t,:t].to(x.device)
 
-        if temp_mask is not None:
-            mask = temp_mask.to(x.device)
-            mask = repeat(mask, 'l i j -> (l bhw) i j', bhw=b*h*w)
-        else:
-            mask = None
+        # if temp_mask is not None:
+        #     mask = temp_mask.to(x.device)
+        #     mask = repeat(mask, 'l i j -> (l bhw) i j', bhw=b*h*w)
+        # else:
+        #     mask = None
 
         if self.only_self_att:
             ## note: if no context is given, cross-attention defaults to self-attention
             for i, block in enumerate(self.transformer_blocks):
-                x = block(x, mask=mask)
+                x = block(x, mask=mask, attn_bias=attn_bias, mode='temporal')
             x = rearrange(x, '(b hw) t c -> b hw t c', b=b).contiguous()
         else:
             x = rearrange(x, '(b hw) t c -> b hw t c', b=b).contiguous()

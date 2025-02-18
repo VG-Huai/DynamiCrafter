@@ -14,7 +14,15 @@ from lvdm.basics import (
     normalization
 )
 from lvdm.modules.attention import SpatialTransformer, TemporalTransformer
-
+try:
+    import xformers
+    import xformers.ops
+    from xformers.ops import fmha
+    from xformers.ops.fmha.attn_bias import BlockDiagonalMask
+    XFORMERS_IS_AVAILBLE = True
+except:
+    XFORMERS_IS_AVAILBLE = False
+import time
 
 class TimestepBlock(nn.Module):
     """
@@ -33,15 +41,15 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None, batch_size=None):
+    def forward(self, x, emb, context=None, batch_size=None, mask=None, attn_bias=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb, batch_size=batch_size)
             elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
+                x = layer(x, context, mask=mask, attn_bias=attn_bias)
             elif isinstance(layer, TemporalTransformer):
                 x = rearrange(x, '(b f) c h w -> b c f h w', b=batch_size)
-                x = layer(x, context)
+                x = layer(x, context, mask=mask, attn_bias=attn_bias)
                 x = rearrange(x, 'b c f h w -> (b f) c h w')
             else:
                 x = layer(x)
@@ -366,6 +374,9 @@ class UNetModel(nn.Module):
         self.default_fs = default_fs
         self.fs_condition = fs_condition
 
+        self.mask_percentages = []
+        self.sampling_step = 0
+        self.efficient = True
         ## Time embedding blocks
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
@@ -546,6 +557,135 @@ class UNetModel(nn.Module):
         )
 
     def forward(self, x, timesteps, context=None, features_adapter=None, fs=None, **kwargs):
+        
+        self.sampling_step += 1
+        print('sampling_step:', self.sampling_step)
+        # y = self.forward_org(x, timesteps, context, features_adapter, fps, **kwargs)
+        # return y
+        
+        # mask = self.compute_similarity_mask(x, threshold=0.95)
+        # mask = None
+        # mask = self.batched_find_idxs_to_keep(x, threshold=0.5, tubelet_size=1, patch_size=1)
+        print('x shape:', x.shape)
+        if timesteps <= 500:
+            mask = self.batched_find_idxs_to_keep(x, threshold=0.3, tubelet_size=1, patch_size=1)
+        else:
+            mask = self.batched_find_idxs_to_keep(x, threshold=0.2, tubelet_size=1, patch_size=1)
+        print('------------------')
+        print('timesteps',  timesteps)
+        total_tokens = mask.numel()
+        filtered_tokens = (mask == 0).sum().item()
+        filtered_percentage = 100.0 * filtered_tokens / total_tokens
+        print(f"Mask Filtering: {filtered_percentage:.2f}% tokens filtered")
+        self.mask_percentages.append(filtered_percentage)       
+        
+        b,_,t,_,_ = x.shape
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).type(x.dtype)
+        emb = self.time_embed(t_emb)
+        
+        ## repeat t times for context [(b t) 77 768] & time embedding
+        ## check if we use per-frame image conditioning
+        _, l_context, _ = context.shape
+        if l_context == 77 + t*16: ## !!! HARD CODE here
+            context_text, context_img = context[:,:77,:], context[:,77:,:]
+            context_text = context_text.repeat_interleave(repeats=t, dim=0)
+            context_img = rearrange(context_img, 'b (t l) c -> (b t) l c', t=t)
+            context = torch.cat([context_text, context_img], dim=1)
+        else:
+            context = context.repeat_interleave(repeats=t, dim=0)
+        emb = emb.repeat_interleave(repeats=t, dim=0)
+        
+        # get mask_dict and attn_bias_dict
+        mask_dict = {}
+        attn_bias_dict = {}
+        
+        cur_h, cur_w = x.shape[-2:]
+        org_h, org_w = cur_h, cur_w
+        for i in range(4):
+            mask_dict[(cur_h, cur_w)] = {}
+            mask_dict[(cur_h, cur_w)]['mask'] = mask
+            mask_dict[(cur_h, cur_w)]['spatial'] = {}
+            mask_dict[(cur_h, cur_w)]['temporal'] = {}
+            mask_dict = self.compute_mask_dict_spatial(mask_dict, cur_h, cur_w)
+            mask_dict = self.compute_mask_dict_temporal(mask_dict, cur_h, cur_w)
+            # spatial mode
+            seq_len_q_spatial = cur_h * cur_w # h * w
+            seq_len_q_temporal = x.shape[2] # t
+            if context is not None:
+                seq_len_kv_spatial = context.shape[1]
+                seq_len_kv_temporal = context.shape[1]
+            else:
+                seq_len_kv_spatial = seq_len_q_spatial
+                seq_len_kv_temporal = seq_len_q_temporal
+            attn_bias_dict[(cur_h, cur_w)] = {}
+            attn_bias_dict[(cur_h, cur_w)]['spatial'] = {}
+            attn_bias_dict[(cur_h, cur_w)]['temporal'] = {}
+            attn_bias_dict[(cur_h, cur_w)]['spatial']['self'], _, _ = create_block_diagonal_attention_mask(mask, seq_len_q_spatial, mode='spatial')
+            attn_bias_dict[(cur_h, cur_w)]['temporal']['self'], _, _ = create_block_diagonal_attention_mask(mask, seq_len_q_temporal, mode='temporal')
+            attn_bias_dict[(cur_h, cur_w)]['spatial']['cross'], _, _ = create_block_diagonal_attention_mask(mask, seq_len_kv_spatial, mode='spatial')
+            attn_bias_dict[(cur_h, cur_w)]['temporal']['cross'], _, _ = create_block_diagonal_attention_mask(mask, seq_len_kv_temporal, mode ='temporal')
+            # attn_bias_dict[(cur_h, cur_w)]['spatial']['self'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_q)
+            # attn_bias_dict[(cur_h, cur_w)]['temporal']['self'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_q)
+            # attn_bias_dict[(cur_h, cur_w)]['spatial']['cross'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_kv)
+            # attn_bias_dict[(cur_h, cur_w)]['temporal']['cross'], _, _ = create_fake_block_diagonal_attention_mask(mask, seq_len_kv)
+            cur_h, cur_w = cur_h//2, cur_w//2
+            mask = self.resize_mask(mask, cur_h, cur_w)
+        ## always in shape (b t) c h w, except for temporal layer
+        x = rearrange(x, 'b c t h w -> (b t) c h w')
+
+        ## combine emb
+        if self.fs_condition:
+            if fs is None:
+                fs = torch.tensor(
+                    [self.default_fs] * b, dtype=torch.long, device=x.device)
+            fs_emb = timestep_embedding(fs, self.model_channels, repeat_only=False).type(x.dtype)
+
+            fs_embed = self.fps_embedding(fs_emb)
+            fs_embed = fs_embed.repeat_interleave(repeats=t, dim=0)
+            emb = emb + fs_embed
+
+        h = x.type(self.dtype)
+        adapter_idx = 0
+        hs = []
+        for id, module in enumerate(self.input_blocks):
+            new_h, new_w = h.shape[-2:]
+            if self.efficient:
+                h = module(h, emb, context=context, batch_size=b, mask=mask_dict[(new_h, new_w)], attn_bias=attn_bias_dict[(new_h, new_w)])
+            else:
+                h = module(h, emb, context=context, batch_size=b)
+            if id ==0 and self.addition_attention:
+                if self.efficient:
+                    h = self.init_attn(h, emb, context=context, batch_size=b, mask=mask_dict[(new_h, new_w)], attn_bias=attn_bias_dict[(new_h, new_w)])
+                else:
+                    h = self.init_attn(h, emb, context=context, batch_size=b)
+            ## plug-in adapter features
+            if ((id+1)%3 == 0) and features_adapter is not None:
+                h = h + features_adapter[adapter_idx]
+                adapter_idx += 1
+            hs.append(h)
+        if features_adapter is not None:
+            assert len(features_adapter)==adapter_idx, 'Wrong features_adapter'
+
+        if self.efficient:
+            new_h, new_w = h.shape[-2:]
+            h = self.middle_block(h, emb, context=context, batch_size=b, mask=mask_dict[(new_h, new_w)], attn_bias=attn_bias_dict[(new_h, new_w)])
+        else:
+            h = self.middle_block(h, emb, context=context, batch_size=b)
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            new_h, new_w = h.shape[-2:]
+            if self.efficient:
+                h = module(h, emb, context=context, batch_size=b, mask=mask_dict[(new_h, new_w)], attn_bias=attn_bias_dict[(new_h, new_w)])
+            else:
+                h = module(h, emb, context=context, batch_size=b)
+        h = h.type(x.dtype)
+        y = self.out(h)
+        
+        # reshape back to (b c t h w)
+        y = rearrange(y, '(b t) c h w -> b c t h w', b=b)
+        return y
+    
+    def forward_org(self, x, timesteps, context=None, features_adapter=None, fs=None, **kwargs):
         b,_,t,_,_ = x.shape
         t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).type(x.dtype)
         emb = self.time_embed(t_emb)
@@ -601,3 +741,233 @@ class UNetModel(nn.Module):
         # reshape back to (b c t h w)
         y = rearrange(y, '(b t) c h w -> b c t h w', b=b)
         return y
+    
+    def batched_find_idxs_to_keep(self, 
+                                x: torch.Tensor, 
+                              threshold: int=2, 
+                              tubelet_size: int=2,
+                              patch_size: int=16) -> torch.Tensor:
+        """
+        Find the static tokens in a video tensor, and return a mask
+        that selects tokens that are not repeated.
+
+        Args:
+        - x (torch.Tensor): A tensor of shape [B, C, T, H, W].
+        - threshold (int): The mean intensity threshold for considering
+                a token as static.
+        - tubelet_size (int): The temporal length of a token.
+        Returns:
+        - mask (torch.Tensor): A bool tensor of shape [B, T, H, W] 
+            that selects tokens that are not repeated.
+
+        """
+        # Ensure input has the format [B, C, T, H, W]
+        assert len(x.shape) == 5, "Input must be a 5D tensor"
+        #ipdb.set_trace()
+        # Convert to float32 if not already
+        x = x.type(torch.float32)
+        
+        # Calculate differences between frames with a step of tubelet_size, ensuring batch dimension is preserved
+        # Compare "front" of first token to "back" of second token
+        diffs = x[:, :, (2*tubelet_size-1)::tubelet_size] - x[:, :, :-tubelet_size:tubelet_size]
+        # Ensure nwe track negative movement.
+        diffs = torch.abs(diffs)
+        
+        # Apply average pooling over spatial dimensions while keeping the batch dimension intact
+        avg_pool_blocks = F.avg_pool3d(diffs, (1, patch_size, patch_size))
+        # Compute the mean along the channel dimension, preserving the batch dimension
+        avg_pool_blocks = torch.mean(avg_pool_blocks, dim=1, keepdim=True)
+        # Create a dummy first frame for each item in the batch
+        first_frame = torch.ones_like(avg_pool_blocks[:, :, 0:1]) * 255
+        # first_frame = torch.zeros_like(avg_pool_blocks[:, :, 0:1])
+        # Concatenate the dummy first frame with the rest of the frames, preserving the batch dimension
+        avg_pool_blocks = torch.cat([first_frame, avg_pool_blocks], dim=2)
+        # Determine indices to keep based on the threshold, ensuring the operation is applied across the batch
+        # Update mask: 0 for high similarity, 1 for low similarity
+        keep_idxs = avg_pool_blocks.squeeze(1) > threshold  
+        keep_idxs = keep_idxs.unsqueeze(1)
+        keep_idxs = keep_idxs.float()
+        # Flatten out everything but the batch dimension
+        # keep_idxs = keep_idxs.flatten(1)
+        #ipdb.set_trace()
+        return keep_idxs
+
+    def compute_similarity_mask(self, latent, threshold=0.95):
+        """
+        Compute frame-wise similarity for latent and generate mask.
+
+        Args:
+        - latent (torch.Tensor): Latent tensor of shape [n, c, t, h, w].
+        - threshold (float): Similarity threshold to determine whether to skip computation.
+
+        Returns:
+        - mask (torch.Tensor): Mask tensor of shape [n, 1, t, h, w],
+        where mask = 0 means skip computation, mask = 1 means recompute.
+        """
+        n, c, t, h, w = latent.shape
+        mask = torch.ones((n, 1, t, h, w), device=latent.device)  # Initialize mask with all 1s
+
+        for frame_idx in range(1, t):  # Start from the second frame
+            curr_frame = latent[:, :, frame_idx, :, :]  # Current frame [n, c, h, w]
+            prev_frame = latent[:, :, frame_idx - 1, :, :]  # Previous frame [n, c, h, w]
+
+            # Compute token-wise cosine similarity
+            dot_product = (curr_frame * prev_frame).sum(dim=1, keepdim=True)  # [n, 1, h, w]
+            norm_curr = curr_frame.norm(dim=1, keepdim=True)
+            norm_prev = prev_frame.norm(dim=1, keepdim=True)
+            similarity = dot_product / (norm_curr * norm_prev + 1e-8)  # Avoid division by zero
+
+            # Update mask: 0 for high similarity, 1 for low similarity
+            mask[:, :, frame_idx, :, :] = (similarity <= threshold).float()
+        # mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        return mask
+    
+    def resize_mask(self, mask, target_h, target_w):
+        """
+        Resize the mask to match the new spatial dimensions of x.
+
+        Args:
+        - mask (torch.Tensor): Input mask of shape [b, 1, t, h, w].
+        - target_h (int): Target height.
+        - target_w (int): Target width.
+
+        Returns:
+        - resized_mask (torch.Tensor): Resized mask of shape [b, 1, t, target_h, target_w].
+        """
+        if mask is None:
+            return mask
+        batch, _, t, h, w = mask.shape
+
+        if h == target_h and w == target_w:
+            return mask  # No resizing needed
+
+        # Reshape to [b * t, 1, h, w]
+        mask = mask.view(batch * t, 1, h, w)
+
+        # Resize to [b * t, 1, target_h, target_w]
+        resized_mask = F.interpolate(mask, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        # Ensure the mask is binary (0 or 1)
+        resized_mask = (resized_mask > 0.5).float()
+
+        # Reshape back to [b, 1, t, target_h, target_w]
+        resized_mask = resized_mask.view(batch, 1, t, target_h, target_w)
+
+        return resized_mask
+    
+    def compute_mask_dict_spatial(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict[(cur_h, cur_w)]['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        _mask = rearrange(_mask, 'b 1 t h w -> (b t) (h w)')
+        # for i in range(_mask.size(0)):
+        #     index_per_batch = torch.where(_mask[i].bool())[0]
+        #     indices.append(index_per_batch)
+        mask_dict[(cur_h, cur_w)]['spatial']['indices'] = indices
+        mask_dict[(cur_h, cur_w)]['spatial']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        mask_bool = mask_bool.T
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        # print('------------------')
+        time_stamp = time.time()
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        # print('time for arange_indices:', time.time()-time_stamp)
+        time_stamp = time.time()
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        # print('time for cumsum_mask:', time.time()-time_stamp)
+        time_stamp = time.time()
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        # print('time for nearest_indices:', time.time()-time_stamp)
+        time_stamp = time.time()
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict[(cur_h, cur_w)]['spatial']['actual_indices'] = actual_indices
+        return mask_dict
+        
+    def compute_mask_dict_temporal(self, mask_dict, cur_h, cur_w):
+        mask = mask_dict[(cur_h, cur_w)]['mask']
+        indices = []
+        _mask = torch.round(mask).to(torch.int)
+        _mask = rearrange(_mask, 'b 1 t h w -> (b h w) (t)')
+        indices1 = torch.nonzero(_mask.reshape(1, -1).squeeze(0))
+        mask_dict[(cur_h, cur_w)]['temporal']['indices'] = indices
+        mask_dict[(cur_h, cur_w)]['temporal']['indices1'] = indices1
+        mask_bool = _mask.bool()
+        device = mask.device
+        batch_size, seq_len = mask_bool.shape
+        arange_indices = torch.arange(seq_len).unsqueeze(0).repeat(batch_size, 1).to(device)
+        nonzero_indices = torch.nonzero(mask_bool, as_tuple=True)
+        valid_indices = torch.zeros_like(arange_indices)
+        valid_indices[nonzero_indices[0], torch.cumsum(mask_bool.int(), dim=1)[mask_bool] - 1] = arange_indices[mask_bool]
+        cumsum_mask = torch.cumsum(mask_bool.int(), dim=1)
+        nearest_indices = torch.clip(cumsum_mask - 1, min=0)
+        actual_indices = valid_indices.gather(1, nearest_indices)
+        mask_dict[(cur_h, cur_w)]['temporal']['actual_indices'] = actual_indices
+        return mask_dict
+    
+def create_fake_block_diagonal_attention_mask(mask, kv_seqlen):
+    """
+    将 mask 和 kv_seqlen 转换为 BlockDiagonalMask，用于高效的注意力计算。
+    
+    Args:
+        mask (torch.Tensor): 输入的掩码，标记哪些 token 应该被忽略。
+        kv_seqlen (torch.Tensor): 键/值的序列长度。
+        heads (int): 注意力头的数量。
+
+    Returns:
+        BlockDiagonalMask: 转换后的注意力掩码，用于高效的计算。
+    """
+    # 计算 q_seqlen: 通过 mask 来提取有效的查询 token 数量
+    # mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
+    mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+    mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
+    # q_seqlen = mask.sum(dim=-1) 
+    num = mask.shape[0]
+    lengh = mask.shape[1]
+    q_seqlen = [int(lengh / 4)] * num
+    
+    kv_seqlen = [kv_seqlen] * len(q_seqlen)  # 重复 kv_seqlen 次
+
+    # 生成 BlockDiagonalPaddedKeysMask
+    attn_bias = BlockDiagonalMask.from_seqlens(
+        q_seqlen,  
+        kv_seqlen=kv_seqlen,  # 键/值的序列长度
+    )
+    
+    return attn_bias, q_seqlen, kv_seqlen
+
+def create_block_diagonal_attention_mask(mask, kv_seqlen, mode='spatial'):
+    """
+    将 mask 和 kv_seqlen 转换为 BlockDiagonalMask，用于高效的注意力计算。
+    
+    Args:
+        mask (torch.Tensor): 输入的掩码，标记哪些 token 应该被忽略。
+        kv_seqlen (torch.Tensor): 键/值的序列长度。
+        heads (int): 注意力头的数量。
+
+    Returns:
+        BlockDiagonalPaddedKeysMask: 转换后的注意力掩码，用于高效的计算。
+    """
+    # 计算 q_seqlen: 通过 mask 来提取有效的查询 token 数量
+    mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+    if mode == 'spatial':
+        mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)')
+    else:
+        mask = rearrange(mask, 'b 1 t h w -> (b h w) (t)')
+    
+    q_seqlen = mask.sum(dim=-1)  # 计算每个批次中有效的查询 token 数量
+    q_seqlen = q_seqlen.tolist()
+    
+    kv_seqlen = [kv_seqlen] * len(q_seqlen)  # 重复 kv_seqlen 次
+
+    # 生成 BlockDiagonalPaddedKeysMask
+    attn_bias = BlockDiagonalMask.from_seqlens(
+        q_seqlen,  
+        kv_seqlen=kv_seqlen,  # 键/值的序列长度
+    )
+    
+    return attn_bias, q_seqlen, kv_seqlen

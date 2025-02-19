@@ -78,7 +78,7 @@ class CrossAttention(nn.Module):
                 self.register_parameter('alpha', nn.Parameter(torch.tensor(0.)) )
 
 
-    def forward(self, x, context=None, mask=None, attn_bias=None, mode=None):
+    def forward(self, x, context=None, mask=None, attn_bias=None, mode=None, use_bias=False):
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
         
@@ -122,6 +122,8 @@ class CrossAttention(nn.Module):
                                                                     attn_bias=attn_bias, op=None)
             out_with_bias = out_with_bias.reshape(1, out_with_bias.shape[1], self.heads * head_dim)
             out_with_bias = self.to_out(out_with_bias)
+            if use_bias:
+                return out_with_bias
                 # return out_with_bias + cat_x.unsqueeze(0)
             # print('attn time with mask: ', time.time() - time_stamp)
             
@@ -138,7 +140,7 @@ class CrossAttention(nn.Module):
             out = out.gather(1, actual_indices)
             return out
         
-        
+        print('org branch')
         if self.image_cross_attention and not spatial_self_attn:
             print("image_cross_attention")
             context, context_image = context[:,:self.text_context_len,:], context[:,self.text_context_len:,:]
@@ -198,12 +200,69 @@ class CrossAttention(nn.Module):
         
         return self.to_out(out)
     
-    def efficient_forward(self, x, context=None, mask=None, attn_bias=None, mode=None):
+    def efficient_forward(self, x, context=None, mask=None, attn_bias=None, mode=None, use_bias=False):
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
+        assert mode == 'spatial'
 
-        q = self.to_q(x)
+        if mask is not None:
+            # indices = mask['indices']
+            indices1 = mask[mode]['indices1']
+            indices2 = indices1.squeeze()
+            actual_indices = mask[mode]['actual_indices']
+            mask = mask['mask']
+        if mask is not None:
+            # time_stamp = time.time()
+            mask = torch.round(mask).to(torch.int) # 0.0 -> 0, 1.0 -> 1
+            mask = rearrange(mask, 'b 1 t h w -> (b t) (h w)') 
+            if context is not None:
+                seq_len_kv = context.shape[1]
+                attn_bias = attn_bias[mode]['cross']
+            else:
+                attn_bias = attn_bias[mode]['self']
+                
+        # q = self.to_q(x)
         context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+        if attn_bias is not None:
+            b, _, _ = x.shape # (bhw, t, c) 
+            # indices1 = torch.nonzero(mask.reshape(1, -1).squeeze(0))
+            cat_x = x.reshape(-1, x.shape[-1])
+            cat_x= torch.index_select(cat_x, 0, indices1.squeeze())
+            # time_stamp = time.time()
+            # print('org prepare cat_x time: ', time.time() - time_stamp)
+            cat_q = self.to_q(cat_x)
+            head_dim = x.shape[-1] // self.heads
+            cat_q = cat_q.view(1, -1, self.heads, head_dim) 
+            cat_k = k.view(1, -1, self.heads, head_dim)
+            cat_v = v.view(1, -1, self.heads, head_dim)
+            
+            out_with_bias = xformers.ops.memory_efficient_attention(cat_q, cat_k, cat_v, 
+                                                                    attn_bias=attn_bias, op=None)
+            out_with_bias = out_with_bias.reshape(1, out_with_bias.shape[1], self.heads * head_dim)
+            out_with_bias = self.to_out(out_with_bias)
+            if use_bias:
+                return out_with_bias
+                # return out_with_bias + cat_x.unsqueeze(0)
+            # print('attn time with mask: ', time.time() - time_stamp)
+            
+            # time_stamp = time.time()
+            out = torch.zeros_like(x)
+            q_dtype = cat_q.dtype
+            out = out.to(q_dtype)
+            out = out.reshape(b, out.shape[1], self.heads * self.dim_head) 
+            
+            out = out.reshape(-1, out.shape[-1])
+            out.index_put_((indices2,), out_with_bias.squeeze())
+            out = out.reshape(b, x.shape[1], self.heads * self.dim_head)
+            actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+            out = out.permute(1, 0, 2)
+            out = out.gather(1, actual_indices).permute(1, 0, 2)
+            return out
+
+        print('org branch')
+
 
         if self.image_cross_attention and not spatial_self_attn:
             context, context_image = context[:,:self.text_context_len,:], context[:,self.text_context_len:,:]
@@ -298,9 +357,39 @@ class BasicTransformerBlock(nn.Module):
     def _forward(self, x, context=None, mask=None, attn_bias=None, mode='spatial'):
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, mask=mask,
                        attn_bias=attn_bias, mode=mode) + x
-        x = self.attn2(self.norm2(x), context=context, mask=mask, attn_bias=attn_bias, mode=mode) + x
-        x = self.ff(self.norm3(x)) + x
+        if mask is not None:
+        # if timesteps.cpu()[0] <= -1: # org mode
+            indices1 = mask[mode]['indices1']
+            indices2 = indices1.squeeze()
+            actual_indices = mask[mode]['actual_indices']
+            cat_x1 = self.attn2(self.norm2(x), context=context, mask=mask, attn_bias=attn_bias, mode=mode, use_bias=True)
+            x2 = self.token_reuse(x, cat_x1, indices2, actual_indices, mode) + x
+            cat_x2 = x2.reshape(-1, x2.shape[-1])
+            cat_x2= torch.index_select(cat_x2, 0, indices1.squeeze())
+            # use_bias=True 的情况下，返回的x1是 out_with_bias + cat_x，形状为(1, token_len, dim)
+            cat_x3 = self.ff(self.norm3(cat_x2))
+            x3 = self.token_reuse(x, cat_x3, indices2, actual_indices, mode) + x2
+            
+            x = x3
+        else:
+            x = self.attn2(self.norm2(x), context=context, mask=mask, attn_bias=attn_bias, mode=mode) + x
+            x = self.ff(self.norm3(x)) + x
+        # x = self.attn2(self.norm2(x), context=context, mask=mask, attn_bias=attn_bias, mode=mode) + x
+        # x = self.ff(self.norm3(x)) + x
         return x
+    
+    def token_reuse(self, x_in, x_out, indices, actual_indices, mode):
+        out = torch.zeros_like(x_in)
+        out = out.reshape(-1, out.shape[-1])
+        out.index_put_((indices,), x_out.squeeze())
+        out = out.reshape(x_in.shape[0], x_in.shape[1], -1) 
+        actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
+        if mode == 'spatial':
+            out = out.permute(1, 0, 2)
+            out = out.gather(1, actual_indices).permute(1, 0, 2)
+        else:
+            out = out.gather(1, actual_indices)
+        return out
 
 
 class SpatialTransformer(nn.Module):
@@ -358,7 +447,7 @@ class SpatialTransformer(nn.Module):
         if self.use_linear:
             x = self.proj_in(x)
         for i, block in enumerate(self.transformer_blocks):
-            x = block(x, context=context, **kwargs)
+            x = block(x, context=context, mask=mask, attn_bias=attn_bias, mode='spatial', **kwargs)
         if self.use_linear:
             x = self.proj_out(x)
         x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()

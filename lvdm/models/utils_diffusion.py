@@ -79,6 +79,10 @@ def make_ddim_timesteps2(ddim_discr_method, num_ddim_timesteps, num_ddpm_timeste
     if ddim_discr_method == 'uniform':
         c = num_ddpm_timesteps // num_ddim_timesteps
         ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
+    elif ddim_discr_method == 'uniform_trailing':
+        c = num_ddpm_timesteps / num_ddim_timesteps
+        ddim_timesteps = np.flip(np.round(np.arange(num_ddpm_timesteps, 0, -c))).astype(np.int64)
+        ddim_timesteps = ddim_timesteps - 2
     elif ddim_discr_method == 'quad':
         ddim_timesteps = ((np.linspace(0, np.sqrt(num_ddpm_timesteps * .8), num_ddim_timesteps)) ** 2).astype(int)
     elif ddim_discr_method == 'quad2':
@@ -96,7 +100,7 @@ def make_ddim_timesteps2(ddim_discr_method, num_ddim_timesteps, num_ddpm_timeste
     
     ddim_timesteps = interpolate_duplicates(ddim_timesteps)
     
-    print(f'Selected timesteps for ddim sampler: {ddim_timesteps}')
+    print(f'Selected timesteps for ddim sampler: {list(ddim_timesteps)}')
     # assert ddim_timesteps.shape[0] == num_ddim_timesteps
     # add one to get the final alpha values right (the ones from first scale to data during sampling)
     steps_out = ddim_timesteps + 1

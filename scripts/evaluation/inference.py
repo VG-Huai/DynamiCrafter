@@ -315,6 +315,10 @@ def run_inference(args, gpu_num, gpu_no):
                 save_results_seperate(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
 
     print(f"Saved in {args.savedir}. Time used: {(time.time() - start):.2f} seconds")
+    mask_percentages = model.model.diffusion_model.mask_percentages
+    # print(f"Mask percentages: {mask_percentages}")
+    with open(os.path.join(args.savedir, 'mask_percentages.txt'), 'w') as f:
+        f.write(str(mask_percentages))
 
 
 def get_parser():

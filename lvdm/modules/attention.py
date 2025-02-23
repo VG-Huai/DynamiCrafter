@@ -101,7 +101,7 @@ class CrossAttention(nn.Module):
                 attn_bias = attn_bias[mode]['self']
         
         h = self.heads
-        q = self.to_q(x)
+        # q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
@@ -139,8 +139,8 @@ class CrossAttention(nn.Module):
             actual_indices = actual_indices.unsqueeze(-1).expand(-1, -1, out.shape[-1])
             out = out.gather(1, actual_indices)
             return out
-        
-        print('org branch')
+        q = self.to_q(x)
+        # print('org branch')
         if self.image_cross_attention and not spatial_self_attn:
             print("image_cross_attention")
             context, context_image = context[:,:self.text_context_len,:], context[:,self.text_context_len:,:]
@@ -261,8 +261,8 @@ class CrossAttention(nn.Module):
             out = out.gather(1, actual_indices).permute(1, 0, 2)
             return out
 
-        print('org branch')
-
+        # print('org branch')
+        q = self.to_q(x)
 
         if self.image_cross_attention and not spatial_self_attn:
             context, context_image = context[:,:self.text_context_len,:], context[:,self.text_context_len:,:]

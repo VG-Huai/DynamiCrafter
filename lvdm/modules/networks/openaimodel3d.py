@@ -377,6 +377,7 @@ class UNetModel(nn.Module):
         self.mask_percentages = []
         self.sampling_step = 0
         self.efficient = True
+        # self.efficient = False
         ## Time embedding blocks
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
@@ -567,10 +568,10 @@ class UNetModel(nn.Module):
         # mask = None
         # mask = self.batched_find_idxs_to_keep(x, threshold=0.5, tubelet_size=1, patch_size=1)
         print('x shape:', x.shape)
-        if timesteps <= 500:
-            mask = self.batched_find_idxs_to_keep(x, threshold=0.3, tubelet_size=1, patch_size=1)
+        if timesteps <= 400:
+            mask = self.batched_find_idxs_to_keep(x, threshold=0.1, tubelet_size=1, patch_size=1)
         else:
-            mask = self.batched_find_idxs_to_keep(x, threshold=0.2, tubelet_size=1, patch_size=1)
+            mask = self.batched_find_idxs_to_keep(x, threshold=0.025, tubelet_size=1, patch_size=1)
         print('------------------')
         print('timesteps',  timesteps)
         total_tokens = mask.numel()

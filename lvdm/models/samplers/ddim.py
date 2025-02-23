@@ -25,6 +25,12 @@ class DDIMSampler(object):
         ddim_discretize= 'uniform'
         self.ddim_timesteps = make_ddim_timesteps2(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
                                                   num_ddpm_timesteps=self.ddpm_num_timesteps)
+        # self.ddim_timesteps = np.array([0, 1, 3, 6, 10, 14, 20, 26, 33, 41, 50, 59, 70, 81, 93, 106, 120, 
+        #                                 134, 150, 166, 183, 201, 220, 239, 260, 281, 303, 326, 349, 374, 399, 426, 
+        #                                 453, 480, 509, 539, 569, 600, 632, 665, 699, 733, 769, 805, 842, 880, 919, 958,978, 998]) #quad2
+        self.ddim_timesteps = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 
+                                        21, 22, 24, 28, 32, 38, 43, 50, 58, 67, 78, 90, 103, 119, 137, 158, 183, 
+                                        211, 243, 280, 322, 371, 428, 493, 567, 654, 753, 867, 980]) # log
         # print(self.ddim_timesteps)
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
@@ -87,7 +93,7 @@ class DDIMSampler(object):
                guidance_rescale=0.0,
                **kwargs
                ):
-        
+        print('timestep_spacing:', timestep_spacing)
         # check condition bs
         if conditioning is not None:
             if isinstance(conditioning, dict):
